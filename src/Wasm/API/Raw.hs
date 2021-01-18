@@ -1,8 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 module Wasm.API.Raw where
 
-import           Data.Int    (Int32, Int64)
-import           Data.Word   (Word8, Word32)
+import           Data.Word   (Word8, Word32, Word64)
 import           Foreign.C
 import           Foreign.Ptr
 
@@ -33,8 +32,7 @@ data WasmByteVec
 data WasmValue
 
 type WasmCallback
-  =  Ptr ()
-  -> Ptr WasmValue
+  =  Ptr WasmValue
   -> Ptr WasmValue
   -> IO (Ptr WasmTrap)
 
@@ -320,10 +318,10 @@ valueKindAnyRef = 128
 valueKindFuncRef = 129
 
 foreign import ccall unsafe "hwasm.h hwasm_set_value_i32"
-  setValueI32 :: Ptr WasmValue -> Int32 -> IO ()
+  setValueI32 :: Ptr WasmValue -> Word32 -> IO ()
 
 foreign import ccall unsafe "hwasm.h hwasm_set_value_i64"
-  setValueI64 :: Ptr WasmValue -> Int64 -> IO ()
+  setValueI64 :: Ptr WasmValue -> Word64 -> IO ()
 
 foreign import ccall unsafe "hwasm.h hwasm_set_value_f32"
   setValueF32 :: Ptr WasmValue -> CFloat -> IO ()
@@ -335,10 +333,10 @@ foreign import ccall unsafe "hwasm.h hwasm_value_kind"
   valueKind :: Ptr WasmValue -> IO Word8
 
 foreign import ccall unsafe "hwasm.h hwasm_get_value_i32"
-  getValueI32 :: Ptr WasmValue -> IO Int32
+  getValueI32 :: Ptr WasmValue -> IO Word32
 
 foreign import ccall unsafe "hwasm.h hwasm_get_value_i64"
-  getValueI64 :: Ptr WasmValue -> IO Int64
+  getValueI64 :: Ptr WasmValue -> IO Word64
 
 foreign import ccall unsafe "hwasm.h hwasm_get_value_f32"
   getValueF32 :: Ptr WasmValue -> IO CFloat

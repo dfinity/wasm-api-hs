@@ -1,4 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable  #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE MultiWayIf          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Wasm.API
   ( Store
@@ -19,7 +21,7 @@ module Wasm.API
   , MemoryType(..)
   -- * Recoverable errors
   , InvalidModule
-  , UnresolvedImport
+  , NewInstanceError
   , Trap
   -- * Unrecoverable errors
   , UnknownValueKind
@@ -56,14 +58,15 @@ import qualified Data.ByteString.Internal as IBS
 import qualified Data.ByteString.Unsafe   as UBS
 import           Data.Coerce              (coerce)
 import           Data.Foldable            (find, for_)
-import           Data.Int                 (Int32, Int64)
+import           Data.Map.Strict          (Map)
+import qualified Data.Map.Strict          as M
 import           Data.Text                (Text)
 import qualified Data.Text                as T
 import qualified Data.Text.Encoding       as T
 import qualified Data.Text.Foreign        as T
 import           Data.Traversable         (for)
 import           Data.Typeable
-import           Data.Word                (Word32, Word8)
+import           Data.Word                (Word32, Word64, Word8)
 import           System.IO.Unsafe         (unsafePerformIO)
 
 import qualified Wasm.API.Raw             as Raw
@@ -128,23 +131,23 @@ data Memory
 data Limits
   = Limits
     { limitsMin :: Word32
-    , limitxMax :: Word32
+    , limitsMax :: Word32
     } deriving (Show, Eq)
 
 data Value
- = I32 Int32
- | I64 Int64
+ = I32 Word32
+ | I64 Word64
  | F32 Float
  | F64 Double
  deriving (Show, Eq)
 
 data ValueType
-  = TypeI32
-  | TypeI64
-  | TypeF32
-  | TypeF64
-  | TypeAnyRef
-  | TypeFuncRef
+  = I32Type
+  | I64Type
+  | F32Type
+  | F64Type
+  | AnyRefType
+  | FuncRefType
  deriving (Show, Eq)
 
 data Extern
@@ -200,11 +203,15 @@ instance Exception UnknownExternKind
 newtype UnknownMutability = UnknownMutability Word8 deriving (Show, Typeable)
 instance Exception UnknownMutability
 
-newtype UnresolvedImport = UnresolvedImport (Text, Text) deriving (Show, Typeable)
-instance Exception UnresolvedImport
-
 newtype Trap = Trap Text deriving (Show, Typeable)
 instance Exception Trap
+
+data NewInstanceError
+  = UnresolvedImport (Text, Text)
+  | StartTrapped Trap
+  deriving (Show, Typeable)
+
+instance Exception NewInstanceError
 
 data WrongResultsArity
   = WrongResultsArity
@@ -243,18 +250,17 @@ newStore engine =
 -- This function may fail if the provided binary is not a WebAssembly
 -- binary or if it does not pass validation. In these cases this
 -- function throws @InvalidModule@ exception.
-newModule :: Store -> ByteString -> IO Module
+newModule :: Store -> ByteString -> IO (Either InvalidModule Module)
 newModule store moduleBytes =
   withByteVec moduleBytes $ \byteVecPtr ->
     withForeignPtr (storePtr store) $ \ptr -> do
         rawModulePtr <- Raw.newModule ptr byteVecPtr
 
-        when (rawModulePtr == nullPtr) $
-          throwIO $ InvalidModule moduleBytes
-
-        modulePtr <- newForeignPtr Raw.deleteModule rawModulePtr
-
-        pure $ Module { modulePtr = modulePtr, moduleStore = store }
+        if rawModulePtr == nullPtr
+        then pure $ Left $ InvalidModule moduleBytes
+        else do
+          modulePtr <- newForeignPtr Raw.deleteModule rawModulePtr
+          pure $ Right $ Module { modulePtr = modulePtr, moduleStore = store }
 
 -- | Instantiates a @Module@ with the provided imports into the @Store@.
 --
@@ -264,31 +270,41 @@ newModule store moduleBytes =
 --
 -- The provided imports must contain at least all the imports returned
 -- by the corresponding @moduleImports@, otherwise this function
--- throws @UnresolvedImport@ exception.
-newInstance :: Store -> Module -> [(Text, Text, Extern)] -> IO Instance
+-- returns @UnresolvedImport@ error.
+newInstance :: Store
+            -> Module
+            -> Map (Text, Text) Extern
+            -> IO (Either NewInstanceError Instance)
 newInstance s m deps = do
   imports <- moduleImports m
-  let externs = resolveImports imports deps
-  withForeignPtr (storePtr s) $ \sPtr ->
-    withForeignPtr (modulePtr m) $ \mPtr ->
-      withExternArray externs $ \arr ->
-        alloca $ \trapPtrPtr -> do
+  case resolveImports imports deps of
+    Left e        -> pure $ Left e
+    Right imports ->
+      withForeignPtr (storePtr s) $ \sPtr ->
+        withForeignPtr (modulePtr m) $ \mPtr ->
+        withExternArray imports $ \arr ->
+          alloca $ \trapPtrPtr -> do
           p <- Raw.newInstance sPtr mPtr arr trapPtrPtr
           trapPtr <- peek trapPtrPtr
-          throwOnTrap trapPtr `finally` deleteTrap trapPtr
-          fptr <- newForeignPtr Raw.deleteInstancePtr p
-          pure $ Instance { instancePtr = fptr
-                          , instanceStore = s
-                          , instanceModule = m
-                          }
+          checkTrap trapPtr >>= \case
+            Just trap -> do
+              deleteTrap trapPtr
+              pure $ Left $ StartTrapped trap
+            Nothing -> do
+              fptr <- newForeignPtr Raw.deleteInstancePtr p
+              pure $ Right $ Instance { instancePtr = fptr
+                                      , instanceStore = s
+                                      , instanceModule = m
+                                      }
 
-throwOnTrap :: Ptr Raw.WasmTrap -> IO ()
-throwOnTrap trapPtr =
-  when (trapPtr /= nullPtr) $
-    bracket Raw.allocateEmptyByteVec Raw.deepFreeByteVec $ \outPtr -> do
-      Raw.trapMessage trapPtr outPtr
-      msg <- vecToName outPtr
-      throwIO $ Trap msg
+checkTrap :: Ptr Raw.WasmTrap -> IO (Maybe Trap)
+checkTrap trapPtr =
+  if trapPtr /= nullPtr
+  then bracket Raw.allocateEmptyByteVec Raw.deepFreeByteVec $ \outPtr -> do
+          Raw.trapMessage trapPtr outPtr
+          msg <- vecToName outPtr
+          pure $ Just $ Trap msg
+  else pure Nothing
 
 -- | Returns the exports of an instance.
 --
@@ -306,12 +322,14 @@ instanceExports inst = do
         Raw.indexExternVec vecPtr (fromIntegral $ pred i) >>= getExtern (instanceStore inst)
       pure $ zipWith (\(name, _t) e -> (name, e)) exports externs
 
-resolveImports :: [(Text, Text, ExternType)] -> [(Text, Text, Extern)] -> [Extern]
-resolveImports imports deps = map findDep imports
+resolveImports :: [(Text, Text, ExternType)]
+               -> Map (Text, Text) Extern
+               -> Either NewInstanceError [Extern]
+resolveImports imports deps = traverse findDep imports
   where findDep (mod, name, _) =
-          case find (\(mod', name', _) -> mod == mod' && name == name') deps of
-            Just (_, _, v) -> v -- TODO: check that type of v matches t
-            Nothing        -> throw $ UnresolvedImport (mod, name)
+          case M.lookup (mod, name) deps of
+            Just v  -> Right v -- TODO: check that type of v matches t
+            Nothing -> Left $ UnresolvedImport (mod, name)
 
 -- | Returns the list of exports that this module provides.
 moduleExports :: Module -> IO [(Text, ExternType)]
@@ -350,7 +368,7 @@ moduleImports m =
 --   - Any of the arguments do not have the correct type.
 --   - Any of the arguments come from a different store than the @Func@ provided.
 --   - Function execution traps.
-call :: Func -> [Value] -> IO [Value]
+call :: Func -> [Value] -> IO (Either Trap [Value])
 call f args =
   withForeignPtr (funcPtr f) $ \fPtr -> do
     paramArity <- Raw.funcParamArity fPtr
@@ -358,8 +376,9 @@ call f args =
     bracket (makeValueArray args) Raw.deleteValueArray $ \paramsPtr ->
       bracket (Raw.newValueArray resultArity) Raw.deleteValueArray $ \resultsPtr ->
         bracket (Raw.callFunc fPtr paramsPtr resultsPtr) deleteTrap $ \trapPtr -> do
-          throwOnTrap trapPtr
-          getValueArray (fromIntegral resultArity) resultsPtr
+          checkTrap trapPtr >>= \case
+            Just trap -> pure $ Left trap
+            Nothing   -> Right <$> getValueArray (fromIntegral resultArity) resultsPtr
 
 -- | Returns the number of values the provided function takes as input.
 funcParamArity :: Func -> Int
@@ -384,7 +403,7 @@ wrapFunc store funcType f = do
   where inArity = length $ funcTypeParams funcType
         outArity = length $ funcTypeResults funcType
 
-        w store _env inValPtr outValPtr = do
+        w store inValPtr outValPtr = do
           args <- getValueArray inArity inValPtr
           handle (\(e :: SomeException) -> newTrap store (T.encodeUtf8 $ T.pack $ show e)) $ do
             results <- f args
@@ -414,12 +433,11 @@ withExternArray externs action = go externs []
 getExtern :: Store -> Ptr Raw.WasmExtern -> IO Extern
 getExtern store ptr = do
   kind <- Raw.externKind ptr
-  let r | kind == Raw.externKindFunc = ExternFunc <$> (Raw.externAsFunc ptr >>= getFunc)
-        | kind == Raw.externKindGlobal = ExternGlobal <$> (Raw.externAsGlobal ptr >>= getGlobal)
-        | kind == Raw.externKindTable = ExternTable <$> (Raw.externAsTable ptr >>= getTable)
-        | kind == Raw.externKindMemory = ExternMemory <$> (Raw.externAsMemory ptr >>= getMemory)
-        | otherwise = throwIO $ UnknownExternKind kind
-  r
+  if | kind == Raw.externKindFunc -> ExternFunc <$> (Raw.externAsFunc ptr >>= getFunc)
+     | kind == Raw.externKindGlobal -> ExternGlobal <$> (Raw.externAsGlobal ptr >>= getGlobal)
+     | kind == Raw.externKindTable -> ExternTable <$> (Raw.externAsTable ptr >>= getTable)
+     | kind == Raw.externKindMemory -> ExternMemory <$> (Raw.externAsMemory ptr >>= getMemory)
+     | otherwise -> throwIO $ UnknownExternKind kind
   where getFunc p = Func store <$> (Raw.copyFunc p >>= newForeignPtr Raw.deleteFuncPtr)
         getGlobal p = Global store <$> (Raw.copyGlobal p >>= newForeignPtr Raw.deleteGlobalPtr)
         getTable p = Table store <$> (Raw.copyTable p >>= newForeignPtr Raw.deleteTablePtr)
@@ -450,12 +468,11 @@ setValueArray vals arr = do
 getValue :: Ptr Raw.WasmValue -> IO Value
 getValue ptr = do
   kind <- Raw.valueKind ptr
-  let r | kind == Raw.valueKindI32 = I32 <$> Raw.getValueI32 ptr
-        | kind == Raw.valueKindI64 = I64 <$> Raw.getValueI64 ptr
-        | kind == Raw.valueKindF32 = F32 . coerce <$> Raw.getValueF32 ptr
-        | kind == Raw.valueKindF64 = F64 . coerce <$> Raw.getValueF64 ptr
-        | otherwise = throwIO $ UnknownValueKind kind
-  r
+  if | kind == Raw.valueKindI32 -> I32 <$> Raw.getValueI32 ptr
+     | kind == Raw.valueKindI64 -> I64 <$> Raw.getValueI64 ptr
+     | kind == Raw.valueKindF32 -> F32 . coerce <$> Raw.getValueF32 ptr
+     | kind == Raw.valueKindF64 -> F64 . coerce <$> Raw.getValueF64 ptr
+     | otherwise -> throwIO $ UnknownValueKind kind
 
 getValueArray :: Int -> Ptr Raw.WasmValue -> IO [Value]
 getValueArray n arr =
@@ -466,12 +483,11 @@ getValueArray n arr =
 getExternType :: Ptr Raw.WasmExternType -> IO ExternType
 getExternType p = do
   kind <- Raw.externTypeKind p
-  let r | kind == Raw.externKindFunc = ExternFuncType <$> (getFuncType =<< Raw.externTypeAsFuncType p)
-        | kind == Raw.externKindGlobal = ExternGlobalType <$> (getGlobalType =<< Raw.externTypeAsGlobalType p)
-        | kind == Raw.externKindTable = ExternTableType <$> (getTableType =<< Raw.externTypeAsTableType p)
-        | kind == Raw.externKindMemory = ExternMemoryType <$> (getMemoryType =<< Raw.externTypeAsMemoryType p)
-        | otherwise = throwIO $ UnknownExternKind kind
-  r
+  if | kind == Raw.externKindFunc -> ExternFuncType <$> (getFuncType =<< Raw.externTypeAsFuncType p)
+     | kind == Raw.externKindGlobal -> ExternGlobalType <$> (getGlobalType =<< Raw.externTypeAsGlobalType p)
+     | kind == Raw.externKindTable -> ExternTableType <$> (getTableType =<< Raw.externTypeAsTableType p)
+     | kind == Raw.externKindMemory -> ExternMemoryType <$> (getMemoryType =<< Raw.externTypeAsMemoryType p)
+     | otherwise -> throwIO $ UnknownExternKind kind
 
 getLimits :: Ptr Raw.WasmLimits -> IO Limits
 getLimits p = Limits <$> Raw.limitsMin p <*> Raw.limitsMax p
@@ -509,23 +525,23 @@ getTableType p = do
 
 getValueType :: Ptr Raw.WasmValueType -> IO ValueType
 getValueType p = Raw.valueTypeKind p >>= classifyValueType
-  where classifyValueType v | v == Raw.valueKindI32 = pure TypeI32
-                            | v == Raw.valueKindI64 = pure TypeI64
-                            | v == Raw.valueKindF32 = pure TypeF32
-                            | v == Raw.valueKindF64 = pure TypeF64
-                            | v == Raw.valueKindAnyRef = pure TypeAnyRef
-                            | v == Raw.valueKindFuncRef = pure TypeFuncRef
+  where classifyValueType v | v == Raw.valueKindI32 = pure I32Type
+                            | v == Raw.valueKindI64 = pure I64Type
+                            | v == Raw.valueKindF32 = pure F32Type
+                            | v == Raw.valueKindF64 = pure F64Type
+                            | v == Raw.valueKindAnyRef = pure AnyRefType
+                            | v == Raw.valueKindFuncRef = pure FuncRefType
                             | otherwise = throwIO $ UnknownValueKind v
 
 newValueType :: ValueType -> IO (Ptr Raw.WasmValueType)
 newValueType v = Raw.newValueType kind
   where kind = case v of
-                 TypeI32     -> Raw.valueKindI32
-                 TypeI64     -> Raw.valueKindI64
-                 TypeF32     -> Raw.valueKindF32
-                 TypeF64     -> Raw.valueKindF64
-                 TypeAnyRef  -> Raw.valueKindAnyRef
-                 TypeFuncRef -> Raw.valueKindFuncRef
+                 I32Type     -> Raw.valueKindI32
+                 I64Type     -> Raw.valueKindI64
+                 F32Type     -> Raw.valueKindF32
+                 F64Type     -> Raw.valueKindF64
+                 AnyRefType  -> Raw.valueKindAnyRef
+                 FuncRefType -> Raw.valueKindFuncRef
 
 getGlobalType :: Ptr Raw.WasmGlobalType -> IO GlobalType
 getGlobalType p = GlobalType <$> (Raw.globalTypeContent p >>= getValueType)
