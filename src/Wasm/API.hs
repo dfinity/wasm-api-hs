@@ -249,7 +249,7 @@ newStore engine =
 --
 -- This function may fail if the provided binary is not a WebAssembly
 -- binary or if it does not pass validation. In these cases this
--- function throws @InvalidModule@ exception.
+-- function returns @InvalidModule@.
 newModule :: Store -> ByteString -> IO (Either InvalidModule Module)
 newModule store moduleBytes =
   withByteVec moduleBytes $ \byteVecPtr ->
@@ -265,8 +265,8 @@ newModule store moduleBytes =
 -- | Instantiates a @Module@ with the provided imports into the @Store@.
 --
 -- Instantiation includes invoking the start function of a Wasm
--- module.  If @start@ traps then this function throws @Trap@
--- exception.
+-- module.  If @start@ traps then this function returns @StartTrapped@
+-- error.
 --
 -- The provided imports must contain at least all the imports returned
 -- by the corresponding @moduleImports@, otherwise this function
@@ -364,7 +364,7 @@ moduleImports m =
 -- parameter list contain exactly @funcParamArity@ arguments, and the
 -- result list will contain exactly @funcResultsArity@ values.
 --
--- This function throws @Trap@ exception on the following occasions:
+-- This function returns a @Trap@ on the following occasions:
 --   - Any of the arguments do not have the correct type.
 --   - Any of the arguments come from a different store than the @Func@ provided.
 --   - Function execution traps.
