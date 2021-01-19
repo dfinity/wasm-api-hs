@@ -1,0 +1,6 @@
+dist-newstyle/
+*.wasm
+*.a
+tags
+TAGS
+
