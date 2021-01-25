@@ -151,6 +151,9 @@ foreign import ccall "wasm.h wasm_memory_data"
 foreign import ccall "wasm.h wasm_memory_data_size"
   memoryDataSize :: Ptr WasmMemory -> IO Word32
 
+foreign import ccall "wasm.h wasm_memory_type"
+  memoryType :: Ptr WasmMemory -> IO (Ptr WasmMemoryType)
+
 foreign import ccall "wasm.h wasm_memory_grow"
   growMemory :: Ptr WasmMemory -> Word32 -> IO CBool
 

@@ -45,6 +45,7 @@ module Wasm.API
   , newMemory
   , memorySize
   , memoryDataSize
+  , memoryType
   , writeMemory
   , readMemory
   , unsafeUseMemory
@@ -448,6 +449,12 @@ memorySize mem =
 memoryDataSize :: Memory -> IO Word32
 memoryDataSize mem =
   withForeignPtr (memoryPtr mem) (\pMem -> Raw.memoryDataSize pMem)
+
+-- | Returns the type of this memory.
+memoryType :: Memory -> MemoryType
+memoryType m = unsafePerformIO $
+  withForeignPtr (memoryPtr m) $ \pMem ->
+    bracket (Raw.memoryType pMem) Raw.deleteMemoryType getMemoryType
 
 -- | Modify memory by writing the bytestring starting at specified offset.
 --
