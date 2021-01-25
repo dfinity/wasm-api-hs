@@ -7,7 +7,7 @@ version:             0.1.0.0
 synopsis:            High-level bindings to WebAssembly C API.
 -- description:
 bug-reports:         https://github.com/dfinity/wasm-api-hs/issues
-license:             Apache 2.0
+license:             Apache-2.0
 license-file:        LICENSE
 author:              Roman Kashitsyn
 maintainer:          roman.kashitsyn@gmail.com
@@ -28,11 +28,25 @@ library
   hs-source-dirs:      src
   default-language:    Haskell2010
 
+test-suite tests
+  type:                exitcode-stdio-1.0
+  hs-source-dirs:      test
+  main-is:             Tests.hs
+  build-depends:       base >=4.12 && <5
+                     , bytestring
+                     , tasty
+                     , tasty-hunit
+                     , wasm-api
+  default-language:    Haskell2010
+  extra-libraries:     wasmtime
+  extra-lib-dirs:      .
+
 executable hello-world
   main-is:             examples/HelloWorld.hs
   build-depends:       base >=4.12 && <5
                      , bytestring
                      , containers
                      , wasm-api
+  default-language:    Haskell2010
   extra-libraries:     wasmtime
   extra-lib-dirs:      .
