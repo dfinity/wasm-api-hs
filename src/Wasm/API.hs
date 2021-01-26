@@ -52,7 +52,8 @@ module Wasm.API
   , growMemory
   ) where
 
-import           Control.Exception        (Exception, SomeException, bracket,
+import           Control.Exception        (ArrayException (IndexOutOfBounds),
+                                           Exception, SomeException, bracket,
                                            finally, handle, throw, throwIO)
 import           Control.Monad            (when)
 
@@ -80,6 +81,7 @@ import           Data.Traversable         (for)
 import           Data.Typeable
 import           Data.Word                (Word32, Word64, Word8)
 import           System.IO.Unsafe         (unsafePerformIO)
+import           Text.Printf              (printf)
 
 import qualified Wasm.API.Raw             as Raw
 
@@ -458,28 +460,35 @@ memoryType m = unsafePerformIO $
 
 -- | Modify memory by writing the bytestring starting at specified offset.
 --
--- The portion of the bytestring that spans beyond the memory data size is ignored.
+-- If [offset, offset + length bytes) is outside of memory bounds,
+-- @IndexOutOfBound@ exception is thrown.
 writeMemory :: Memory -> Word32 -> ByteString -> IO ()
 writeMemory mem offset bytes =
   unsafeUseMemory mem $ \pBytes memLen ->
     UBS.unsafeUseAsCStringLen bytes $ \(pStr, strLen) -> do
-      let n = if memLen < offset then 0 else min (memLen - offset) (fromIntegral strLen)
-      IBS.memcpy (plusPtr pBytes $ fromIntegral offset) (castPtr pStr) (fromIntegral n)
+      let end = (fromIntegral offset + fromIntegral strLen) :: Word64
+      when (end > fromIntegral memLen) $
+        throwIO $ IndexOutOfBounds $ printf "write [%d, %d) is outside of memory bounds [0, %d)" offset end memLen
+      IBS.memcpy (plusPtr pBytes $ fromIntegral offset) (castPtr pStr) strLen
 
 -- | Read the portion of memory specified by offset and size.
 --
--- The read request is clipped to the memory size, i.e. the read returns the data located in
--- the intersection of ranges @[offset, offset + size)@ and @[0, memoryDataSize mem)@.
+-- If requested [offset, offset + size) range is outside of memory
+-- bounds, @IndexOutOfBound@ exception is thrown.
 readMemory :: Memory -> Word32 -> Word32 -> IO ByteString
 readMemory mem offset size =
   unsafeUseMemory mem $ \pBytes memLen -> do
+    let end = (fromIntegral offset + fromIntegral size) :: Word64
+    when (end > fromIntegral memLen) $
+      throwIO $ IndexOutOfBounds $ printf "read [%d, %d) is outside of memory bounds [0, %d)" offset end memLen
     let n = fromIntegral $ if memLen < offset then 0 else min size (memLen - offset)
     IBS.create n (\dst -> IBS.memcpy dst (plusPtr pBytes $ fromIntegral offset) n)
 
 -- | Directly applies an operation to the memory contents.
 --
--- The operation  accepts a pointer to memory data and the number of
--- bytes available.
+-- The operation accepts a pointer to memory data and the number of
+-- bytes available. The pointer is only valid for the duration of
+-- @unsafeUseMemory@ call.
 unsafeUseMemory :: Memory -> (Ptr Word8 -> Word32 -> IO a) -> IO a
 unsafeUseMemory mem action =
   withForeignPtr (memoryPtr mem) $ \pMem -> do
