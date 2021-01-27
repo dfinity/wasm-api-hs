@@ -139,6 +139,30 @@ foreign import ccall "wasm.h wasm_memory_copy"
 foreign import ccall "wasm.h &wasm_memory_delete"
   deleteMemoryPtr :: FunPtr (Ptr WasmMemory -> IO ())
 
+foreign import ccall "wasm.h wasm_memory_new"
+  newMemory :: Ptr WasmStore -> Ptr WasmMemoryType -> IO (Ptr WasmMemory)
+
+foreign import ccall "wasm.h wasm_memory_size"
+  memorySize :: Ptr WasmMemory -> IO Word32
+
+foreign import ccall "wasm.h wasm_memory_data"
+  memoryData :: Ptr WasmMemory -> IO (Ptr Word8)
+
+foreign import ccall "wasm.h wasm_memory_data_size"
+  memoryDataSize :: Ptr WasmMemory -> IO Word32
+
+foreign import ccall "wasm.h wasm_memory_type"
+  memoryType :: Ptr WasmMemory -> IO (Ptr WasmMemoryType)
+
+foreign import ccall "wasm.h wasm_memory_grow"
+  growMemory :: Ptr WasmMemory -> Word32 -> IO CBool
+
+foreign import ccall "wasm.h wasm_memorytype_new"
+  newMemoryType :: Ptr WasmLimits -> IO (Ptr WasmMemoryType)
+
+foreign import ccall "wasm.h wasm_memorytype_delete"
+  deleteMemoryType :: Ptr WasmMemoryType -> IO ()
+
 -- Traps
 
 foreign import ccall unsafe "wasm.h wasm_trap_new"

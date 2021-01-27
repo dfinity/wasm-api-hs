@@ -1,7 +1,8 @@
-{-# LANGUAGE DeriveDataTypeable  #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE MultiWayIf          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 module Wasm.API
   ( Store
   , Module
@@ -19,6 +20,7 @@ module Wasm.API
   , GlobalType(..)
   , TableType(..)
   , MemoryType(..)
+  , NumPages(..)
   -- * Recoverable errors
   , InvalidModule
   , NewInstanceError
@@ -36,11 +38,22 @@ module Wasm.API
   , moduleImports
   , moduleExports
   , instanceExports
+  -- * Creating and calling functions
   , call
   , wrapFunc
+  -- * Manipulating instance memory
+  , newMemory
+  , memorySize
+  , memoryDataSize
+  , memoryType
+  , writeMemory
+  , readMemory
+  , unsafeUseMemory
+  , growMemory
   ) where
 
-import           Control.Exception        (Exception, SomeException, bracket,
+import           Control.Exception        (ArrayException (IndexOutOfBounds),
+                                           Exception, SomeException, bracket,
                                            finally, handle, throw, throwIO)
 import           Control.Monad            (when)
 
@@ -68,8 +81,13 @@ import           Data.Traversable         (for)
 import           Data.Typeable
 import           Data.Word                (Word32, Word64, Word8)
 import           System.IO.Unsafe         (unsafePerformIO)
+import           Text.Printf              (printf)
 
 import qualified Wasm.API.Raw             as Raw
+
+-- | A newtype for number of Wasm memory pages (64KiB).
+newtype NumPages = NumPages { numPagesToWord32 :: Word32 }
+  deriving (Show, Eq, Ord, Num, Bounded)
 
 newtype Engine = Engine { enginePtr :: ForeignPtr Raw.WasmEngine }
 
@@ -414,6 +432,79 @@ wrapFunc store funcType f = do
             setValueArray results outValPtr
             pure nullPtr
 
+-- | Creates a new memory in the provided store.
+newMemory :: Store -> MemoryType -> IO Memory
+newMemory s ty =
+  withForeignPtr (storePtr s) $ \pStore ->
+    withMemoryType ty $ \pMemTy -> do
+      p <- newForeignPtr Raw.deleteMemoryPtr =<< Raw.newMemory pStore pMemTy
+      pure $ Memory { memoryStore = s
+                    , memoryPtr = p
+                    }
+
+-- | Returns the size of the provided memory in pages.
+memorySize :: Memory -> IO NumPages
+memorySize mem =
+  withForeignPtr (memoryPtr mem) (\pMem -> NumPages <$> Raw.memorySize pMem)
+
+-- | Returns the size of the provided memory in bytes.
+memoryDataSize :: Memory -> IO Word32
+memoryDataSize mem =
+  withForeignPtr (memoryPtr mem) (\pMem -> Raw.memoryDataSize pMem)
+
+-- | Returns the type of this memory.
+memoryType :: Memory -> MemoryType
+memoryType m = unsafePerformIO $
+  withForeignPtr (memoryPtr m) $ \pMem ->
+    bracket (Raw.memoryType pMem) Raw.deleteMemoryType getMemoryType
+
+-- | Modify memory by writing the bytestring starting at specified offset.
+--
+-- If [offset, offset + length bytes) is outside of memory bounds,
+-- @IndexOutOfBound@ exception is thrown.
+writeMemory :: Memory -> Word32 -> ByteString -> IO ()
+writeMemory mem offset bytes =
+  unsafeUseMemory mem $ \pBytes memLen ->
+    UBS.unsafeUseAsCStringLen bytes $ \(pStr, strLen) -> do
+      let end = (fromIntegral offset + fromIntegral strLen) :: Word64
+      when (end > fromIntegral memLen) $
+        throwIO $ IndexOutOfBounds $ printf "write [%d, %d) is outside of memory bounds [0, %d)" offset end memLen
+      IBS.memcpy (plusPtr pBytes $ fromIntegral offset) (castPtr pStr) strLen
+
+-- | Read the portion of memory specified by offset and size.
+--
+-- If requested [offset, offset + size) range is outside of memory
+-- bounds, @IndexOutOfBound@ exception is thrown.
+readMemory :: Memory -> Word32 -> Word32 -> IO ByteString
+readMemory mem offset size =
+  unsafeUseMemory mem $ \pBytes memLen -> do
+    let end = (fromIntegral offset + fromIntegral size) :: Word64
+    when (end > fromIntegral memLen) $
+      throwIO $ IndexOutOfBounds $ printf "read [%d, %d) is outside of memory bounds [0, %d)" offset end memLen
+    let n = fromIntegral $ if memLen < offset then 0 else min size (memLen - offset)
+    IBS.create n (\dst -> IBS.memcpy dst (plusPtr pBytes $ fromIntegral offset) n)
+
+-- | Directly applies an operation to the memory contents.
+--
+-- The operation accepts a pointer to memory data and the number of
+-- bytes available. The pointer is only valid for the duration of
+-- @unsafeUseMemory@ call.
+unsafeUseMemory :: Memory -> (Ptr Word8 -> Word32 -> IO a) -> IO a
+unsafeUseMemory mem action =
+  withForeignPtr (memoryPtr mem) $ \pMem -> do
+    pData <- Raw.memoryData pMem
+    pSize <- Raw.memoryDataSize pMem
+    action pData pSize
+
+-- | Attempts to grow the provided memory by delta memory pages.
+-- This function is similar to @memory.grow@ Wasm instruction.
+-- Returns @true@ if grow succeeded, @false@ otherwise.
+growMemory :: Memory -> NumPages -> IO Bool
+growMemory mem delta =
+  withForeignPtr (memoryPtr mem) $ \pMem ->
+    toBool <$> Raw.growMemory pMem (numPagesToWord32 delta)
+  where toBool (CBool b) = b /= 0
+
 deleteTrap :: Ptr Raw.WasmTrap -> IO ()
 deleteTrap ptr = when (ptr /= nullPtr) $ Raw.deleteTrap ptr
 
@@ -552,6 +643,17 @@ getGlobalType p = GlobalType <$> (Raw.globalTypeContent p >>= getValueType)
 
 getMemoryType :: Ptr Raw.WasmMemoryType -> IO MemoryType
 getMemoryType p = MemoryType <$> (getLimits =<< Raw.memoryTypeLimits p)
+
+withLimits :: Limits -> (Ptr Raw.WasmLimits -> IO a) -> IO a
+withLimits l action = do
+  bracket Raw.newLimits Raw.deleteLimits $ \pLim -> do
+    Raw.limitsSet pLim (limitsMin l) (limitsMax l)
+    action pLim
+
+withMemoryType :: MemoryType -> (Ptr Raw.WasmMemoryType -> IO a) -> IO a
+withMemoryType ty action =
+  withLimits (memoryTypeLimits ty) $ \pLim ->
+    bracket (Raw.newMemoryType pLim) Raw.deleteMemoryType action
 
 bsToVec :: ByteString -> IO (Ptr Raw.WasmByteVec)
 bsToVec bs =
